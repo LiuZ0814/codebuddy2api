@@ -1,4 +1,7 @@
+import base64
+import hashlib
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -7,13 +10,42 @@ from pathlib import Path
 import httpx
 
 import admin.server as admin_server
+from core.workbuddy_atrest_crypto import encrypt_auth_field, is_encrypted_field
 
 ADMIN = "admin-test-credential-long-enough"
 API = "client-existing-key"
 
+# 与 test_workbuddy_atrest.py 使用同一个测试密钥，避免两个文件互相污染
+# protector_key() 的进程级缓存（_cached_key 一旦写入就不再读环境变量）。
+TEST_SECRET = base64.b64encode(hashlib.sha256(b"test-seed").digest()).decode()
+_ORIGINAL_SECRET = os.environ.get("WORKBUDDY_AT_REST_SECRET")
+
+
+def setUpModule():
+    os.environ["WORKBUDDY_AT_REST_SECRET"] = TEST_SECRET
+
+
+def tearDownModule():
+    if _ORIGINAL_SECRET is None:
+        os.environ.pop("WORKBUDDY_AT_REST_SECRET", None)
+    else:
+        os.environ["WORKBUDDY_AT_REST_SECRET"] = _ORIGINAL_SECRET
+
 
 def credential(uid="one", name="测试账号"):
     return {"account": {"uid": uid, "nickname": name, "enterpriseId": "test"}, "auth": {"accessToken": "private-access-token", "refreshToken": "private-refresh-token", "expiresAt": int(time.time() * 1000) + 3600000}}
+
+
+def encrypted_credential(uid="enc", name="加密账号"):
+    """WorkBuddy 5.6+ 形态：token 是 $wbEncrypted 信封，其余字段照旧。"""
+    return {
+        "account": {"uid": uid, "nickname": name, "enterpriseId": "test"},
+        "auth": {
+            "accessToken": encrypt_auth_field("encrypted-access-token"),
+            "refreshToken": encrypt_auth_field("encrypted-refresh-token"),
+            "expiresAt": int(time.time() * 1000) + 3600000,
+        },
+    }
 
 
 class AdminTests(unittest.IsolatedAsyncioTestCase):
@@ -102,6 +134,45 @@ class AdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 413)
         r = await self.client.get("/admin/assets/unknown.js")
         self.assertEqual(r.status_code, 404)
+
+    async def test_import_encrypted_credential(self):
+        """5.6+ 的 $wbEncrypted 凭据必须能导入，且落盘后仍保持加密。"""
+        await self.login()
+        doc = encrypted_credential()
+        base = (await self.client.get("/admin/api/overview")).json()["accounts"][0]
+        r = await self.client.post("/admin/api/accounts", json={"credential": doc})
+        self.assertEqual(r.status_code, 200, r.text)
+        aid = r.json()["id"]
+
+        # 落盘仍为加密形态：转换器刷新 token 时要按原格式回写，
+        # 明文回写会让 WorkBuddy 客户端报 integrity 错误。
+        stored = json.loads((self.auth / (aid + ".info")).read_text(encoding="utf-8"))
+        self.assertTrue(is_encrypted_field(stored["auth"]["accessToken"]))
+        self.assertTrue(is_encrypted_field(stored["auth"]["refreshToken"]))
+
+        # 昵称照常展示，不能把信封 repr 泄漏成账号名。
+        row = next(a for a in (await self.client.get("/admin/api/overview")).json()["accounts"] if a["id"] == aid)
+        self.assertEqual(row["name"], "加密账号")
+        self.assertEqual(row["nickname"], "加密账号")
+        self.assertTrue(base["active"])
+
+    async def test_undecryptable_credential_returns_400(self):
+        """信封损坏不能冒成 500，必须按 400 拒绝并给出可读原因。"""
+        await self.login()
+        doc = encrypted_credential()
+        doc["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "not-base64!!"}
+        r = await self.client.post("/admin/api/accounts", json={"credential": doc})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("解密", r.text)
+
+    async def test_plaintext_credential_still_accepted(self):
+        """旧版明文凭据路径不回归。"""
+        await self.login()
+        r = await self.client.post("/admin/api/accounts", json={"credential": credential("legacy")})
+        self.assertEqual(r.status_code, 200, r.text)
+        aid = r.json()["id"]
+        stored = json.loads((self.auth / (aid + ".info")).read_text(encoding="utf-8"))
+        self.assertEqual(stored["auth"]["accessToken"], "private-access-token")
 
     async def test_logout_and_rate_limit(self):
         await self.login()

@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from core import converter
+from core.workbuddy_atrest_crypto import decrypt_auth_field, is_encrypted_field
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
@@ -48,6 +49,20 @@ def clean_name(value, fallback):
     return value.strip()
 
 
+def account_nickname(doc):
+    """取账号昵称明文。5.6+ 的 nickname 也可能是 $wbEncrypted 信封。
+
+    昵称是可选的展示字段，读不出来就当空串，不要因此阻断导入。
+    """
+    value = (doc.get("account") or {}).get("nickname")
+    if is_encrypted_field(value):
+        try:
+            return decrypt_auth_field(value)
+        except Exception:
+            return ""
+    return value if isinstance(value, str) else ""
+
+
 class Store:
     def __init__(self, root, auth_dir, initial_key, admin_key):
         if len(admin_key) < 20:
@@ -75,7 +90,7 @@ class Store:
                 except (ValueError, OSError, HTTPException):
                     continue
                 aid = secrets.token_hex(8)
-                name = str(doc.get("account", {}).get("nickname") or "已迁移账号")[:60]
+                name = (account_nickname(doc) or "已迁移账号")[:60]
                 self.data["accounts"][aid] = {"name": name, "file": p.name, "enabled": not bool(doc.get("disabled")), "created": int(time.time())}
                 if self.data["active"] is None and not doc.get("disabled"):
                     self.data["active"] = aid
@@ -85,13 +100,31 @@ class Store:
         self.sync_active()
 
     @staticmethod
+    def credential_secret(value):
+        """取凭据字段的明文。
+
+        5.6+ 的桌面端 .info 把 accessToken／refreshToken 存成
+        {"$wbEncrypted":1,"envelope":...} 信封，旧版则是明文 str。
+        解密失败一律按 400 处理，本方法的契约是不向上抛非 HTTPException。
+        """
+        if is_encrypted_field(value):
+            try:
+                return decrypt_auth_field(value)
+            except Exception:
+                # 可能的原因：缺 cryptography、keyId 与本机不一致、信封损坏、
+                # AEAD 校验失败。都表示"这份凭据在本机读不出来"。
+                raise HTTPException(400, "凭据无法解密，请在导出该凭据的机器上导入") from None
+        return value if isinstance(value, str) else None
+
+    @staticmethod
     def validate_credential(doc):
         if not isinstance(doc, dict) or not isinstance(doc.get("auth"), dict) or not isinstance(doc.get("account"), dict):
             raise HTTPException(400, "需要桌面端 .info／JSON 登录文件，包含 auth 和 account 对象")
         for key in ("accessToken", "refreshToken"):
-            if not isinstance(doc["auth"].get(key), str) or not doc["auth"][key].strip():
+            secret = Store.credential_secret(doc["auth"].get(key))
+            if not secret or not secret.strip():
                 raise HTTPException(400, "凭据缺少 accessToken 或 refreshToken，请重新导出桌面端登录文件")
-            if len(doc["auth"][key]) > 65536:
+            if len(secret) > 65536:
                 raise HTTPException(400, "凭据字段过长")
         if not isinstance(doc["account"].get("uid"), str) or not doc["account"]["uid"]:
             raise HTTPException(400, "凭据缺少 account.uid")
@@ -136,7 +169,7 @@ class Store:
                 raise HTTPException(400, "最多保存 100 个账号")
             aid = secrets.token_hex(8)
             write_json(self.auth_dir / (aid + ".info"), doc)
-            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or str(doc["account"].get("nickname") or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
+            self.data["accounts"][aid] = {"file": aid + ".info", "name": name or (account_nickname(doc) or "浏览器授权账号")[:60], "created": int(time.time()), "enabled": True}
             if self.data["active"] is None:
                 self.data["active"] = aid
             self.save()
@@ -167,7 +200,7 @@ class Store:
             try:
                 doc = json.loads(self.file_for(item).read_text(encoding="utf-8"))
                 expiry = doc["auth"].get("expiresAt", 0)
-                row.update({"nickname": str(doc["account"].get("nickname") or ""), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
+                row.update({"nickname": account_nickname(doc), "uid": str(doc["account"].get("uid") or ""), "expires_at": expiry, "expired": expiry < time.time() * 1000, "refresh_available": bool(doc["auth"].get("refreshToken")), "status": "ready"})
             except (ValueError, OSError, KeyError):
                 row.update({"status": "invalid", "expired": True, "expires_at": 0, "refresh_available": False})
             result.append(row)
@@ -419,7 +452,7 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
         body = await payload(req)
         doc = body.get("credential")
         store.validate_credential(doc)
-        name = clean_name(body.get("name"), str(doc["account"].get("nickname") or "新账号")[:60])
+        name = clean_name(body.get("name"), (account_nickname(doc) or "新账号")[:60])
         with store.lock:
             if len(store.data["accounts"]) >= 100:
                 raise HTTPException(400, "最多保存 100 个账号")
